@@ -1,0 +1,132 @@
+# Builds the signed Sip 'N' Spin Android App Bundle from the private Forgejo repo.
+# mode=bundle_only keeps the .aab as a run artifact (for the one-time manual first upload in Play Console);
+# mode=internal also uploads it to the Play internal testing track.
+# Secrets: FORGEJO_CLONE_TOKEN, APP_DEFINES_JSON, ANDROID_UPLOAD_KEYSTORE_B64, ANDROID_KEY_PROPERTIES, PLAY_SERVICE_ACCOUNT_JSON.
+name: android-play
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Forgejo branch, tag or commit of hiten/sipnspin'
+        default: main
+        required: true
+      mode:
+        description: 'bundle_only = build and keep the .aab; internal = also upload to the internal testing track'
+        type: choice
+        options: [bundle_only, internal]
+        default: bundle_only
+
+concurrency:
+  group: android-play
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.8
+  PACKAGE: uk.co.noctallabs.sipnspin
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Clone source
+        env:
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad ref"; exit 1; }
+          git init -q src
+          git -C src remote add origin https://git.hiten-patel.co.uk/hiten/sipnspin.git
+          git -C src -c http.extraHeader="Authorization: token $TOKEN" fetch -q --depth 1 origin "$REF"
+          git -C src checkout -q --detach FETCH_HEAD
+          echo "Building $(git -C src rev-parse --short HEAD) ($REF)"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 -b "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Signed bundle
+        working-directory: src/app
+        env:
+          DEFINES: ${{ secrets.APP_DEFINES_JSON }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_B64 }}
+          KEY_PROPERTIES: ${{ secrets.ANDROID_KEY_PROPERTIES }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [ -n "$KEYSTORE_B64" ] && [ -n "$KEY_PROPERTIES" ] || { echo "::error::upload key secrets missing"; exit 1; }
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/upload.jks"
+          # Point storeFile at the decoded keystore; keep passwords and alias from the secret.
+          printf '%s\n' "$KEY_PROPERTIES" | grep -v '^storeFile=' > android/key.properties
+          echo "storeFile=$RUNNER_TEMP/upload.jks" >> android/key.properties
+          printf '%s' "$DEFINES" > "$RUNNER_TEMP/defines.json"
+          python3 - "$RUNNER_TEMP/defines.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          if "E2E_CALENDAR_NAME" in d:
+              sys.exit("APP_DEFINES_JSON must not set E2E_CALENDAR_NAME for a store build")
+          for k in ("SUPABASE_URL", "SUPABASE_PUBLISHABLE_KEY", "GOOGLE_WEB_CLIENT_ID"):
+              if not str(d.get(k, "")).strip():
+                  sys.exit(f"APP_DEFINES_JSON is missing {k}")
+          PY
+          flutter pub get
+          # Play build numbers start at 100 so they never collide with local/debug ones.
+          flutter build appbundle --release --build-number "$((BUILD_NUMBER + 100))" --dart-define-from-file="$RUNNER_TEMP/defines.json"
+          rm -f "$RUNNER_TEMP/defines.json" android/key.properties
+          keytool -printcert -jarfile build/app/outputs/bundle/release/app-release.aab | grep -E "SHA1:" | head -1
+          rm -f "$RUNNER_TEMP/upload.jks"
+          echo "Bundle version code $((BUILD_NUMBER + 100))"
+
+      - name: Keep the bundle (private repo artifact, 7 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sipnspin-aab
+          path: src/app/build/app/outputs/bundle/release/app-release.aab
+          retention-days: 7
+
+      - name: Upload to Play internal testing
+        if: ${{ inputs.mode == 'internal' }}
+        env:
+          SA_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$SA_JSON" > "$RUNNER_TEMP/sa.json"
+          trap 'rm -f "$RUNNER_TEMP/sa.json"' EXIT
+          python3 -m pip install -q google-auth requests
+          python3 - "$RUNNER_TEMP/sa.json" src/app/build/app/outputs/bundle/release/app-release.aab <<'PY'
+          import os, sys, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+          creds = service_account.Credentials.from_service_account_file(sys.argv[1], scopes=["https://www.googleapis.com/auth/androidpublisher"])
+          creds.refresh(Request())
+          H = {"Authorization": f"Bearer {creds.token}"}
+          pkg = os.environ["PACKAGE"]
+          base = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{pkg}"
+          def ok(r):
+              if r.status_code >= 300:
+                  sys.exit(f"Play API {r.status_code}: {r.text[:500]}")
+              return r.json() if r.text else {}
+          edit = ok(requests.post(f"{base}/edits", headers=H))["id"]
+          with open(sys.argv[2], "rb") as f:
+              b = ok(requests.post(f"https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/{pkg}/edits/{edit}/bundles?uploadType=media",
+                                   headers={**H, "Content-Type": "application/octet-stream"}, data=f))
+          vc = b["versionCode"]
+          ok(requests.put(f"{base}/edits/{edit}/tracks/internal", headers=H,
+                          json={"track": "internal", "releases": [{"versionCodes": [str(vc)], "status": "completed"}]}))
+          ok(requests.post(f"{base}/edits/{edit}:commit", headers=H))
+          print(f"Uploaded version code {vc} to internal testing")
+          PY
