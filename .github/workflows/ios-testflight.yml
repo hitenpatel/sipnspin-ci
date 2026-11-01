@@ -62,6 +62,7 @@ jobs:
         env:
           DEFINES: ${{ secrets.APP_DEFINES_JSON }}
           BUILD_NUMBER: ${{ github.run_number }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           umask 077
@@ -76,9 +77,16 @@ jobs:
               sys.exit("APP_DEFINES_JSON must not set E2E_CALENDAR_NAME for a TestFlight build")
           PY
           flutter pub get
-          flutter build ipa --release --no-codesign \
+          # Configure Flutter (dart-defines, build number), then archive with xcodebuild so the
+          # Runner entitlements (Sign in with Apple) are recorded in the archive; signing happens at export.
+          flutter build ios --release --config-only \
             --build-number "$BUILD_NUMBER" \
             --dart-define-from-file="$RUNNER_TEMP/defines.json"
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath build/ios/archive/Runner.xcarchive \
+            DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic CODE_SIGNING_ALLOWED=NO \
+            > "$RUNNER_TEMP/archive.log" 2>&1 || { grep -E "error:" "$RUNNER_TEMP/archive.log" | head -40; echo "::error::archive failed"; exit 1; }
           rm -f "$RUNNER_TEMP/defines.json"
           APP=build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app
           pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$APP/Info.plist"; }
@@ -86,6 +94,13 @@ jobs:
           [ "$(pb CFBundleVersion)" = "$BUILD_NUMBER" ] || { echo "::error::archived build number is not $BUILD_NUMBER"; exit 1; }
           [ "$(pb ITSAppUsesNonExemptEncryption)" = "false" ] || { echo "::error::ITSAppUsesNonExemptEncryption is not false"; exit 1; }
           echo "Archived $(pb CFBundleShortVersionString) ($BUILD_NUMBER)"
+          XCENT="$APP/archived-expanded-entitlements.xcent"
+          if [ -f "$XCENT" ]; then
+            grep -q "com.apple.developer.applesignin" "$XCENT" || { echo "::error::archive entitlements lack Sign in with Apple"; cat "$XCENT"; exit 1; }
+            echo "Archive entitlements include Sign in with Apple"
+          else
+            echo "::error::archive has no archived-expanded-entitlements.xcent"; ls "$APP"; exit 1
+          fi
 
       - name: Sign and upload to TestFlight
         if: ${{ inputs.mode == 'upload' || inputs.mode == 'inspect' }}
@@ -135,7 +150,8 @@ jobs:
           grep -E "Upload succeeded|EXPORT SUCCEEDED|Uploaded" "$RUNNER_TEMP/export.log" || tail -5 "$RUNNER_TEMP/export.log"
           if [ "${{ inputs.mode }}" = inspect ]; then
             cd "$RUNNER_TEMP/export" && unzip -q -o *.ipa
-            echo "== Signed entitlements"; codesign -d --entitlements :- Payload/Runner.app 2>/dev/null
+            echo "== Signed entitlements"; codesign -d --entitlements :- Payload/Runner.app 2>/dev/null | tee "$RUNNER_TEMP/ent.plist"
+            grep -q applesignin "$RUNNER_TEMP/ent.plist" || { echo "::error::signed app lacks Sign in with Apple"; exit 1; }
             echo "== Archive entitlements (build settings)"; ls "$GITHUB_WORKSPACE/src/app/build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app/" | grep -i xcent || true
             exit 0
           fi
