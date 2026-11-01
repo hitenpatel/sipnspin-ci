@@ -94,13 +94,12 @@ jobs:
           [ "$(pb CFBundleVersion)" = "$BUILD_NUMBER" ] || { echo "::error::archived build number is not $BUILD_NUMBER"; exit 1; }
           [ "$(pb ITSAppUsesNonExemptEncryption)" = "false" ] || { echo "::error::ITSAppUsesNonExemptEncryption is not false"; exit 1; }
           echo "Archived $(pb CFBundleShortVersionString) ($BUILD_NUMBER)"
-          XCENT="$APP/archived-expanded-entitlements.xcent"
-          if [ -f "$XCENT" ]; then
-            grep -q "com.apple.developer.applesignin" "$XCENT" || { echo "::error::archive entitlements lack Sign in with Apple"; cat "$XCENT"; exit 1; }
-            echo "Archive entitlements include Sign in with Apple"
-          else
-            echo "::error::archive has no archived-expanded-entitlements.xcent"; ls "$APP"; exit 1
-          fi
+          # The archive is unsigned, so it carries no entitlements and the cloud-signed export would drop
+          # Sign in with Apple. An ad-hoc signature with the Runner entitlements gives export something to keep.
+          grep -q "com.apple.developer.applesignin" ios/Runner/Runner.entitlements || { echo "::error::Runner.entitlements lacks Sign in with Apple"; exit 1; }
+          codesign --force --sign - --timestamp=none --entitlements ios/Runner/Runner.entitlements "$APP"
+          codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q applesignin || { echo "::error::ad-hoc signature lacks Sign in with Apple"; exit 1; }
+          echo "Archive carries Sign in with Apple"
 
       - name: Sign and upload to TestFlight
         if: ${{ inputs.mode == 'upload' || inputs.mode == 'inspect' }}
