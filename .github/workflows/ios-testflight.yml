@@ -12,9 +12,9 @@ on:
         default: main
         required: true
       mode:
-        description: 'upload = archive, sign and upload to TestFlight; archive_only = stop after the unsigned archive'
+        description: 'upload = archive, sign and upload to TestFlight; archive_only = stop after the unsigned archive; inspect = sign and export locally, print entitlements, no upload'
         type: choice
-        options: [upload, archive_only]
+        options: [upload, archive_only, inspect]
         default: upload
 
 concurrency:
@@ -88,7 +88,7 @@ jobs:
           echo "Archived $(pb CFBundleShortVersionString) ($BUILD_NUMBER)"
 
       - name: Sign and upload to TestFlight
-        if: ${{ inputs.mode == 'upload' }}
+        if: ${{ inputs.mode == 'upload' || inputs.mode == 'inspect' }}
         working-directory: src/app
         env:
           ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
@@ -106,12 +106,13 @@ jobs:
           printf '%s' "$ASC_KEY_B64" | base64 --decode > "$KEY"
           openssl pkey -in "$KEY" -noout 2>/dev/null || { echo "::error::the App Store Connect key does not decode to a private key"; exit 1; }
           OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
-          TEAM="$TEAM" python3 - "$OPTIONS" <<'PY'
+          DEST=upload; [ "${{ inputs.mode }}" = inspect ] && DEST=export
+          DEST="$DEST" TEAM="$TEAM" python3 - "$OPTIONS" <<'PY'
           import os, plistlib, sys
           with open(sys.argv[1], "wb") as fh:
               plistlib.dump({
                   "method": "app-store-connect",
-                  "destination": "upload",
+                  "destination": os.environ["DEST"],
                   "teamID": os.environ["TEAM"],
                   "signingStyle": "automatic",
                   "uploadSymbols": True,
@@ -132,4 +133,10 @@ jobs:
             exit 1
           fi
           grep -E "Upload succeeded|EXPORT SUCCEEDED|Uploaded" "$RUNNER_TEMP/export.log" || tail -5 "$RUNNER_TEMP/export.log"
+          if [ "${{ inputs.mode }}" = inspect ]; then
+            cd "$RUNNER_TEMP/export" && unzip -q -o *.ipa
+            echo "== Signed entitlements"; codesign -d --entitlements :- Payload/Runner.app 2>/dev/null
+            echo "== Archive entitlements (build settings)"; ls "$GITHUB_WORKSPACE/src/app/build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app/" | grep -i xcent || true
+            exit 0
+          fi
           echo "Uploaded build ${{ github.run_number }}. It appears in TestFlight after Apple's processing (usually 5-15 minutes)."
