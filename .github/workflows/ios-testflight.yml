@@ -1,0 +1,135 @@
+# Builds the Sip 'N' Spin iOS app from the private Forgejo repo and uploads it to TestFlight.
+# Dispatch: Actions -> ios-testflight -> Run workflow (ref defaults to main).
+# Secrets: FORGEJO_CLONE_TOKEN (read-only), APPLE_TEAM_ID, APP_DEFINES_JSON (dart-defines),
+#          APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_PRIVATE_KEY_B64.
+name: ios-testflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Forgejo branch, tag or commit of hiten/sipnspin'
+        default: main
+        required: true
+      mode:
+        description: 'upload = archive, sign and upload to TestFlight; archive_only = stop after the unsigned archive'
+        type: choice
+        options: [upload, archive_only]
+        default: upload
+
+concurrency:
+  group: ios-testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.8
+  BUNDLE_ID: uk.co.noctallabs.sipnspin
+
+jobs:
+  testflight:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Clone source
+        env:
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad ref"; exit 1; }
+          git init -q src
+          git -C src remote add origin https://git.hiten-patel.co.uk/hiten/sipnspin.git
+          git -C src -c http.extraHeader="Authorization: token $TOKEN" fetch -q --depth 1 origin "$REF"
+          git -C src checkout -q --detach FETCH_HEAD
+          echo "Building $(git -C src rev-parse --short HEAD) ($REF)"
+
+      - name: Install Flutter
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 -b "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain versions
+        run: |
+          flutter --version
+          xcodebuild -version
+
+      - name: Unsigned archive
+        working-directory: src/app
+        env:
+          DEFINES: ${{ secrets.APP_DEFINES_JSON }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$DEFINES" > "$RUNNER_TEMP/defines.json"
+          python3 - "$RUNNER_TEMP/defines.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          for k in ("SUPABASE_URL", "SUPABASE_PUBLISHABLE_KEY", "GOOGLE_WEB_CLIENT_ID", "GOOGLE_IOS_CLIENT_ID"):
+              if not str(d.get(k, "")).strip():
+                  sys.exit(f"APP_DEFINES_JSON is missing {k}")
+          if "E2E_CALENDAR_NAME" in d:
+              sys.exit("APP_DEFINES_JSON must not set E2E_CALENDAR_NAME for a TestFlight build")
+          PY
+          flutter pub get
+          flutter build ipa --release --no-codesign \
+            --build-number "$BUILD_NUMBER" \
+            --dart-define-from-file="$RUNNER_TEMP/defines.json"
+          rm -f "$RUNNER_TEMP/defines.json"
+          APP=build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$APP/Info.plist"; }
+          [ "$(pb CFBundleIdentifier)" = "$BUNDLE_ID" ] || { echo "::error::archived bundle id is not $BUNDLE_ID"; exit 1; }
+          [ "$(pb CFBundleVersion)" = "$BUILD_NUMBER" ] || { echo "::error::archived build number is not $BUILD_NUMBER"; exit 1; }
+          [ "$(pb ITSAppUsesNonExemptEncryption)" = "false" ] || { echo "::error::ITSAppUsesNonExemptEncryption is not false"; exit 1; }
+          echo "Archived $(pb CFBundleShortVersionString) ($BUILD_NUMBER)"
+
+      - name: Sign and upload to TestFlight
+        if: ${{ inputs.mode == 'upload' }}
+        working-directory: src/app
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_B64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_B64 }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_B64 TEAM; do
+            [ -n "${!name}" ] || { echo "::error::secret for $name is missing"; exit 1; }
+          done
+          umask 077
+          KEY="$RUNNER_TEMP/asc-key.p8"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s' "$ASC_KEY_B64" | base64 --decode > "$KEY"
+          openssl pkey -in "$KEY" -noout 2>/dev/null || { echo "::error::the App Store Connect key does not decode to a private key"; exit 1; }
+          OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+          TEAM="$TEAM" python3 - "$OPTIONS" <<'PY'
+          import os, plistlib, sys
+          with open(sys.argv[1], "wb") as fh:
+              plistlib.dump({
+                  "method": "app-store-connect",
+                  "destination": "upload",
+                  "teamID": os.environ["TEAM"],
+                  "signingStyle": "automatic",
+                  "uploadSymbols": True,
+                  "manageAppVersionAndBuildNumber": False,
+              }, fh)
+          PY
+          # Cloud-managed distribution signing through the API key: no certificates or profiles in the repo.
+          if ! xcodebuild -exportArchive \
+                -archivePath build/ios/archive/Runner.xcarchive \
+                -exportPath "$RUNNER_TEMP/export" \
+                -exportOptionsPlist "$OPTIONS" \
+                -allowProvisioningUpdates \
+                -authenticationKeyPath "$KEY" \
+                -authenticationKeyID "$ASC_KEY_ID" \
+                -authenticationKeyIssuerID "$ASC_ISSUER_ID" > "$RUNNER_TEMP/export.log" 2>&1; then
+            grep -E "error|Error|ERROR" "$RUNNER_TEMP/export.log" | head -40
+            echo "::error::export/upload failed"
+            exit 1
+          fi
+          grep -E "Upload succeeded|EXPORT SUCCEEDED|Uploaded" "$RUNNER_TEMP/export.log" || tail -5 "$RUNNER_TEMP/export.log"
+          echo "Uploaded build ${{ github.run_number }}. It appears in TestFlight after Apple's processing (usually 5-15 minutes)."
