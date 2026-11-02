@@ -155,8 +155,18 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
+      - name: Free disk space
+        run: |
+          set -uo pipefail
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android/sdk/ndk /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift /opt/az 2>/dev/null
+          sudo docker image prune --all --force >/dev/null 2>&1
+          sudo apt-get clean >/dev/null 2>&1
+          df -h / | tail -1
+
       - name: Clone source
         env:
           TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
@@ -189,6 +199,23 @@ jobs:
           flutter --version
           (cd app && flutter pub get)
 
+      - name: Cache Gradle and pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.pub-cache
+          key: shots-gradle-${{ runner.os }}-${{ hashFiles('src/app/pubspec.lock', 'src/app/android/**/*.gradle*', 'src/app/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: shots-gradle-${{ runner.os }}-
+
+      - name: Build the debug APK (before the emulator, so build and emulator do not compete)
+        working-directory: src/app
+        run: |
+          set -euo pipefail
+          flutter build apk --debug --target integration_test/store_screenshots_test.dart
+          df -h / | tail -1
+
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -210,7 +237,7 @@ jobs:
           demo network -e mobile show -e datatype none -e level 4
           demo notifications -e visible false
           export SHOTS_DIR=screenshots/android
-          flutter drive --driver test_driver/integration_test.dart --target integration_test/store_screenshots_test.dart -d emulator-5554
+          timeout 900 flutter drive --driver test_driver/integration_test.dart --target integration_test/store_screenshots_test.dart -d emulator-5554
           demo exit
           SH
 
@@ -222,6 +249,7 @@ jobs:
           arch: x86_64
           profile: pixel_9
           disable-animations: true
+          emulator-boot-timeout: 600
           working-directory: src/app
           script: bash ${{ runner.temp }}/android-shots.sh
 
