@@ -1,0 +1,245 @@
+# Generates the App Store and Google Play screenshots from the private Forgejo repo, with fake services
+# and the real event posters (no secrets besides the clone token; nothing from the production backend).
+# Dispatch: Actions -> store-screenshots -> Run workflow (ref defaults to main).
+# Artifacts: store-screenshots-ios (screenshots/ios/6.9, screenshots/ios/6.5) and store-screenshots-android.
+# Secrets: FORGEJO_CLONE_TOKEN (read-only).
+name: store-screenshots
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Forgejo branch, tag or commit of hiten/sipnspin'
+        default: main
+        required: true
+
+concurrency:
+  group: store-screenshots
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.8
+  EXPECTED_SHOTS: '01_whats_on 02_event_detail 03_loyalty 04_venue 05_splash'
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - name: Clone source
+        env:
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad ref"; exit 1; }
+          git init -q src
+          git -C src remote add origin https://git.hiten-patel.co.uk/hiten/sipnspin.git
+          git -C src -c http.extraHeader="Authorization: token $TOKEN" fetch -q --depth 1 origin "$REF"
+          git -C src checkout -q --detach FETCH_HEAD
+          echo "Shooting $(git -C src rev-parse --short HEAD) ($REF)"
+
+      - name: Install Flutter
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 -b "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Stage posters and dependencies
+        working-directory: src
+        run: |
+          set -euo pipefail
+          scripts/app-store-shots-prep.sh
+          flutter --version
+          xcodebuild -version
+          (cd app && flutter pub get)
+
+      - name: Pick simulators (6.9 inch and 6.5 inch)
+        run: |
+          set -euo pipefail
+          xcrun simctl list devicetypes | grep -E "iPhone" | tail -40
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, subprocess, sys
+
+          def simctl(*a):
+              return json.loads(subprocess.check_output(["xcrun", "simctl", *a, "-j"]))
+
+          types = {t["name"]: t["identifier"] for t in simctl("list", "devicetypes")["devicetypes"]}
+          runtimes = [r for r in simctl("list", "runtimes")["runtimes"]
+                      if r.get("isAvailable") and r["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS")]
+          if not runtimes:
+              sys.exit("::error::no available iOS simulator runtime")
+          devices = simctl("list", "devices", "available")["devices"]
+
+          def pick(label, candidates):
+              for name in candidates:
+                  ident = types.get(name)
+                  if not ident:
+                      continue
+                  # Newest iOS runtime that supports this device type.
+                  for rt in sorted(runtimes, key=lambda r: [int(x) for x in r["version"].split(".")], reverse=True):
+                      if not any(s["identifier"] == ident for s in rt.get("supportedDeviceTypes", [])):
+                          continue
+                      for d in devices.get(rt["identifier"], []):
+                          if d["name"] == name:
+                              print(f"{label}_UDID={d['udid']}")
+                              print(f"{label}_NAME={name}")
+                              print(f"picked {label}: {name} on iOS {rt['version']} (existing)", file=sys.stderr)
+                              return
+                      udid = subprocess.check_output(["xcrun", "simctl", "create", f"shots {name}", ident, rt["identifier"]]).decode().strip()
+                      print(f"{label}_UDID={udid}")
+                      print(f"{label}_NAME={name}")
+                      print(f"picked {label}: {name} on iOS {rt['version']} (created)", file=sys.stderr)
+                      return
+              sys.exit(f"::error::no simulator available for {label}; tried {candidates}")
+
+          pick("SIM69", ["iPhone 17 Pro Max"])
+          # 6.5 inch (1242x2688): iPhone 11 Pro Max, else the XS Max.
+          pick("SIM65", ["iPhone 11 Pro Max", "iPhone XS Max"])
+          PY
+
+      - name: Shoot 6.9 inch
+        working-directory: src/app
+        env:
+          SHOTS_DIR: screenshots/ios/6.9
+        run: |
+          set -euo pipefail
+          echo "Device: $SIM69_NAME ($SIM69_UDID)"
+          xcrun simctl boot "$SIM69_UDID" || true
+          xcrun simctl bootstatus "$SIM69_UDID" -b
+          xcrun simctl status_bar "$SIM69_UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --cellularBars 4 --wifiBars 3
+          flutter drive --driver test_driver/integration_test.dart --target integration_test/store_screenshots_test.dart -d "$SIM69_UDID"
+
+      - name: Shoot 6.5 inch
+        working-directory: src/app
+        env:
+          SHOTS_DIR: screenshots/ios/6.5
+        run: |
+          set -euo pipefail
+          echo "Device: $SIM65_NAME ($SIM65_UDID)"
+          xcrun simctl boot "$SIM65_UDID" || true
+          xcrun simctl bootstatus "$SIM65_UDID" -b
+          xcrun simctl status_bar "$SIM65_UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --cellularBars 4 --wifiBars 3
+          flutter drive --driver test_driver/integration_test.dart --target integration_test/store_screenshots_test.dart -d "$SIM65_UDID"
+
+      - name: Check screenshots
+        if: ${{ always() }}
+        working-directory: src/app/screenshots/ios
+        run: |
+          set -uo pipefail
+          rc=0
+          for dir in 6.9 6.5; do
+            for n in $EXPECTED_SHOTS; do
+              f="$dir/$n.png"
+              if [ -s "$f" ]; then echo "$f $(sips -g pixelWidth -g pixelHeight "$f" | awk '/pixel/ {printf "%s ", $2}')"; else echo "::error::missing $f"; rc=1; fi
+            done
+          done
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: store-screenshots-ios
+          path: src/app/screenshots/ios
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Shut simulators down
+        if: ${{ always() }}
+        run: |
+          xcrun simctl shutdown "${SIM69_UDID:-}" 2>/dev/null || true
+          xcrun simctl shutdown "${SIM65_UDID:-}" 2>/dev/null || true
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Clone source
+        env:
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad ref"; exit 1; }
+          git init -q src
+          git -C src remote add origin https://git.hiten-patel.co.uk/hiten/sipnspin.git
+          git -C src -c http.extraHeader="Authorization: token $TOKEN" fetch -q --depth 1 origin "$REF"
+          git -C src checkout -q --detach FETCH_HEAD
+          echo "Shooting $(git -C src rev-parse --short HEAD) ($REF)"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 -b "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Stage posters and dependencies
+        working-directory: src
+        run: |
+          set -euo pipefail
+          scripts/app-store-shots-prep.sh
+          flutter --version
+          (cd app && flutter pub get)
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Write the emulator script
+        run: |
+          cat > "$RUNNER_TEMP/android-shots.sh" <<'SH'
+          set -euo pipefail
+          adb wait-for-device
+          # Clean status bar: demo mode with a 9:41 clock, full battery and signal, no notifications.
+          adb shell settings put global sysui_demo_allowed 1
+          demo() { adb shell am broadcast -a com.android.systemui.demo -e command "$@" >/dev/null; }
+          demo enter
+          demo clock -e hhmm 0941
+          demo battery -e level 100 -e plugged false
+          demo network -e wifi show -e level 4
+          demo network -e mobile show -e datatype none -e level 4
+          demo notifications -e visible false
+          export SHOTS_DIR=screenshots/android
+          flutter drive --driver test_driver/integration_test.dart --target integration_test/store_screenshots_test.dart -d emulator-5554
+          demo exit
+          SH
+
+      - name: Shoot on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_9
+          disable-animations: true
+          working-directory: src/app
+          script: bash ${{ runner.temp }}/android-shots.sh
+
+      - name: Check screenshots
+        if: ${{ always() }}
+        working-directory: src/app/screenshots/android
+        run: |
+          set -uo pipefail
+          rc=0
+          for n in $EXPECTED_SHOTS; do
+            if [ -s "$n.png" ]; then echo "$n.png $(file "$n.png" | sed 's/.*PNG image data, //; s/,.*//')"; else echo "::error::missing $n.png"; rc=1; fi
+          done
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: store-screenshots-android
+          path: src/app/screenshots/android
+          retention-days: 7
+          if-no-files-found: error
