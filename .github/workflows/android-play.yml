@@ -33,6 +33,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: Free disk space and cap Gradle memory
+        run: |
+          set -uo pipefail
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift /opt/az 2>/dev/null
+          sudo docker image prune --all --force >/dev/null 2>&1
+          df -h / | tail -1
+          # The app's gradle.properties asks for an 8G heap + 4G metaspace, which with the Kotlin daemon
+          # exhausts the 16G runner and gets the runner killed mid-build. User-level properties win.
+          mkdir -p ~/.gradle
+          printf '%s\n' 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g' 'kotlin.daemon.jvmargs=-Xmx2g' \
+            'org.gradle.workers.max=2' 'org.gradle.daemon=false' > ~/.gradle/gradle.properties
+
       - name: Clone source
         env:
           TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
