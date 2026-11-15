@@ -1,0 +1,41 @@
+# Pushes the Google Play store listing (text, icon, feature graphic, phone screenshots) from the private
+# Forgejo repo's docs/store/play + docs/store/screenshots/android via scripts/play-listing.py.
+# Secrets: FORGEJO_CLONE_TOKEN, PLAY_SERVICE_ACCOUNT_JSON.
+name: play-listing
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Forgejo branch, tag or commit of hiten/sipnspin'
+        default: main
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  listing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone source
+        env:
+          TOKEN: ${{ secrets.FORGEJO_CLONE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad ref"; exit 1; }
+          git init -q src
+          git -C src remote add origin https://git.hiten-patel.co.uk/hiten/sipnspin.git
+          git -C src -c http.extraHeader="Authorization: token $TOKEN" fetch -q --depth 1 origin "$REF"
+          git -C src checkout -q --detach FETCH_HEAD
+
+      - name: Push listing
+        working-directory: src
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          pip install -q google-auth requests
+          python3 scripts/play-listing.py
